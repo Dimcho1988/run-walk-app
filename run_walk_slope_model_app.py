@@ -274,14 +274,36 @@ def apply_basic_filters(segments):
 
 
 # ---------------------------------------------------------
-# МОДЕЛ ЗА НАКЛОН – регресия v(slope) върху целия диапазон
+# МОДЕЛ ЗА НАКЛОН – F(s) = V0 / v(s), регресия върху F
 # ---------------------------------------------------------
-def get_slope_training_data(seg_f):
+def compute_global_flat_speed(seg_f):
+    """
+    Намира глобална референтна скорост на равно V0 от всички сегменти
+    с |slope| <= 1% и valid_basic.
+    """
+    df = seg_f.copy()
+    mask_flat = (
+        df["valid_basic"]
+        & df["slope_pct"].between(-1.0, 1.0)
+        & (df["v_kmh"] > 0)
+        & df["slope_pct"].notna()
+    )
+    flat = df.loc[mask_flat]
+    if flat.empty:
+        return None
+    return float(flat["v_kmh"].mean())
+
+
+def get_slope_training_data(seg_f, V0):
     """
     Обучаващи данни за наклоновия модел:
     - всички валидни сегменти със v_kmh > 0
     - наклон в диапазон [-MAX_ABS_SLOPE, +MAX_ABS_SLOPE]
+    - за всеки сегмент F_raw = V0 / v_kmh
     """
+    if V0 is None or V0 <= 0:
+        return pd.DataFrame(columns=["activity", "slope_pct", "F_raw"])
+
     df = seg_f.copy()
     mask = (
         df["valid_basic"]
@@ -290,62 +312,63 @@ def get_slope_training_data(seg_f):
         & df["slope_pct"].notna()
     )
     train = df.loc[mask, ["activity", "slope_pct", "v_kmh"]].copy()
-    return train
+    if train.empty:
+        return pd.DataFrame(columns=["activity", "slope_pct", "F_raw"])
+
+    train["F_raw"] = V0 / train["v_kmh"]
+    return train[["activity", "slope_pct", "F_raw"]]
 
 
 def fit_slope_poly(train_df):
     """
-    Фитва полином v_model(s) върху v_kmh ~ slope_pct
-    (регресия върху целия диапазон).
+    Фитва полином F_model(s) върху F_raw ~ slope_pct.
+    След това коригира така, че F(0) = 1 (аналогично на ski модела).
     """
     if train_df.empty:
         return None
 
     x = train_df["slope_pct"].values.astype(float)
-    y = train_df["v_kmh"].values.astype(float)
+    y = train_df["F_raw"].values.astype(float)
 
     if len(x) <= SLOPE_POLY_DEG:
         return None
 
     coeffs = np.polyfit(x, y, SLOPE_POLY_DEG)
-    return np.poly1d(coeffs)
+    raw_poly = np.poly1d(coeffs)
+
+    # Корекция: F(0) = 1
+    F0 = float(raw_poly(0.0))
+    offset = F0 - 1.0
+    coeffs_corr = raw_poly.coefficients.copy()
+    coeffs_corr[-1] -= offset
+    slope_poly = np.poly1d(coeffs_corr)
+
+    return slope_poly
 
 
 def compute_slope_F(slopes, slope_poly, alpha_slope):
     """
     Изчислява корекционния коефициент F(s) за наклона:
 
-      1) v_model(s) = poly(s)
-      2) V0 = v_model(0) – типична скорост на равно
-      3) F_raw(s) = V0 / v_model(s)
-      4) клипваме до [F_MIN_SLOPE, F_MAX_SLOPE]
-      5) правила:
+      1) F_model(s) = poly(s)
+      2) клипваме до [F_MIN_SLOPE, F_MAX_SLOPE]
+      3) правила:
           |s| <= 1% → F = 1
           s < -1%  → F <= 1 (спускане)
           s >  1%  → F >= 1 (изкачване)
-      6) омекотяване: F = 1 + α * (F - 1)
+      4) омекотяване: F = 1 + α * (F - 1)
     """
     slopes = np.asarray(slopes, dtype=float)
     if slope_poly is None:
         return np.ones_like(slopes, dtype=float)
 
-    # 1) v_model(s)
-    v_model = slope_poly(slopes)
+    # 1) F_model(s)
+    F_model = slope_poly(slopes)
 
-    # 2) V0 = v_model(0) – скорост на равно според регресията
-    V0 = float(slope_poly(0.0))
+    # 2) клип
+    F = np.clip(F_model, F_MIN_SLOPE, F_MAX_SLOPE)
 
-    # защита от делене на 0/отрицателни модели
-    eps = 1e-6
-    v_model_safe = np.where(v_model > eps, v_model, eps)
-
-    # 3) суров коефициент
-    F_raw = V0 / v_model_safe
-
-    # 4) клип
-    F = np.clip(F_raw, F_MIN_SLOPE, F_MAX_SLOPE)
-
-    # 5) правила около 0% наклон
+    # 3) правила около 0% наклон
     abs_s = np.abs(slopes)
 
     # |s| <= 1% → без корекция
@@ -360,7 +383,7 @@ def compute_slope_F(slopes, slope_poly, alpha_slope):
     mask_up = slopes > 1.0
     F[mask_up] = np.maximum(F[mask_up], 1.0)
 
-    # 6) омекотяване към 1.0
+    # 4) омекотяване към 1.0
     F = 1.0 + alpha_slope * (F - 1.0)
 
     return F
@@ -369,7 +392,7 @@ def compute_slope_F(slopes, slope_poly, alpha_slope):
 def apply_slope_modulation(seg_f, slope_poly, alpha_slope, V_crit=None):
     """
     Прилага корекция по наклон върху v_kmh, за да получим v_flat_eq.
-    Няма glide-модел – тук работим директно със сегментната скорост v_kmh.
+    Работи директно със сегментната скорост v_kmh и F(s) от модела.
 
     Ако V_crit е подаден, може да се добавят допълнителни ограничения за
     много стръмни спускания (по желание).
@@ -522,19 +545,20 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 
 
 # ---------------------------------------------------------
-# STREAMLIT APP – Бягане и ходене (TCX)
+# STREAMLIT APP – Бягане и ходене (TCX, F-модел)
 # ---------------------------------------------------------
-st.set_page_config(page_title="Run/Walk Slope Normalization", layout="wide")
-st.title("Модел за приравняване на скоростта при бягане и ходене (наклон)")
+st.set_page_config(page_title="Run/Walk Slope Normalization (F-model)", layout="wide")
+st.title("Модел за приравняване на скоростта при бягане и ходене (наклон, F-модел)")
 
 st.markdown(
     """
 Този app:
 1. Чете TCX файлове от бягане или ходене  
 2. Сегментира ги на 30-секундни сегменти  
-3. Обучава регресионен модел v(slope) върху целия диапазон наклони  
-4. Нормализира скоростта към „еквивалентна на равно“ v_flat_eq  
-5. Изчислява зони по скорост и пулс  
+3. Определя референтна скорост на равно V₀ от сегментите с |наклон| ≤ 1%  
+4. Изгражда нормализиращ коефициент F(s) = V₀ / v(s) и фитва полином F_model(s)  
+5. Нормализира скоростта към „еквивалентна на равно“ v_flat_eq = v · F_model(s)  
+6. Изчислява зони по скорост и пулс  
 """
 )
 
@@ -561,7 +585,7 @@ ALPHA_SLOPE = st.sidebar.slider(
     step=0.05,
     help=(
         "Коефициент за омекотяване на корекцията по наклон.\n"
-        "β = 1 → пълна корекция според регресията.\n"
+        "β = 1 → пълна корекция според F-модела.\n"
         "β = 0 → без корекция по наклон (v_flat_eq = v_kmh)."
     ),
 )
@@ -613,18 +637,27 @@ if segments.empty:
 # 3) Базови филтри
 segments_f = apply_basic_filters(segments)
 
-# 4) Обучение на наклоновия модел
-slope_train = get_slope_training_data(segments_f)
+# 4) Глобална V0 от равните сегменти
+V0 = compute_global_flat_speed(segments_f)
+if V0 is None:
+    st.error("Няма достатъчно валидни равни сегменти (|наклон| ≤ 1%), "
+             "за да определим референтна скорост V₀.")
+    st.stop()
+
+st.caption(f"Оценена референтна скорост на равно: **V₀ ≈ {V0:.2f} km/h**")
+
+# 5) Обучение на F-модела
+slope_train = get_slope_training_data(segments_f, V0)
 slope_poly = fit_slope_poly(slope_train)
 
 if slope_poly is None:
     st.warning("Няма достатъчно данни за надежден наклонов модел. "
                "Ще използваме суровата сегментна скорост (без корекция).")
 
-# 5) Прилагане на наклоновия модел
+# 6) Прилагане на наклоновия модел
 seg_slope = apply_slope_modulation(segments_f, slope_poly, ALPHA_SLOPE, V_crit=V_crit)
 
-# 6) Зони по скорост
+# 7) Зони по скорост
 seg_zones = assign_speed_zones(seg_slope, V_crit)
 
 # ---------------------------------------------------------
@@ -665,38 +698,44 @@ summary = summary[[
 st.dataframe(summary, use_container_width=True)
 
 # ---------------------------------------------------------
-# ГРАФИКА 1 – Наклонов модел v(s)
+# ГРАФИКА 1 – F(s) модел (нормализационен коефициент)
 # ---------------------------------------------------------
-st.subheader("Зависимост скорост–наклон (регресионен модел)")
+st.subheader("Нормализационен коефициент F(s) спрямо наклона")
 
 if not slope_train.empty and slope_poly is not None:
     s_min = slope_train["slope_pct"].min()
     s_max = slope_train["slope_pct"].max()
     s_grid = np.linspace(s_min, s_max, 200)
+    F_grid = compute_slope_F(s_grid, slope_poly, ALPHA_SLOPE)
+
     df_curve = pd.DataFrame({
         "slope_pct": s_grid,
-        "v_model": slope_poly(s_grid),
+        "F_model": F_grid,
     })
 
-    chart_points = alt.Chart(slope_train).mark_circle(size=30).encode(
+    # Точки: F_raw от обучаващите данни (без омекотяване и правила)
+    slope_train_plot = slope_train.copy()
+    slope_train_plot["F_raw"] = slope_train_plot["F_raw"]
+
+    chart_points = alt.Chart(slope_train_plot).mark_circle(size=30).encode(
         x=alt.X("slope_pct", title="Наклон [%]"),
-        y=alt.Y("v_kmh", title="Скорост [km/h]"),
+        y=alt.Y("F_raw", title="F_raw = V₀ / v"),
         color="activity:N"
     )
 
     chart_curve = alt.Chart(df_curve).mark_line().encode(
         x="slope_pct",
-        y="v_model"
+        y=alt.Y("F_model", title="F_model(s) (след клип и омекотяване)")
     )
 
     st.altair_chart(chart_points + chart_curve, use_container_width=True)
 
     st.markdown(
-        f"**Модел за наклон:**  v_model(s) = {poly_to_str(slope_poly, var='s')}  \n"
-        "Нормализацията използва V(0)/v_model(s) с клип и омекотяване β."
+        f"**Модел за наклон (F-модел):**  F_model(s) = {poly_to_str(slope_poly, var='s')}  \n"
+        "Реалната корекция е F(s) след клип, правила (спускане/изкачване) и омекотяване β."
     )
 else:
-    st.info("Няма достатъчно данни за визуализация на наклоновия модел.")
+    st.info("Няма достатъчно данни за визуализация на F-модела.")
 
 # ---------------------------------------------------------
 # ГРАФИКА 2 – Времева серия v_kmh vs v_flat_eq
@@ -732,7 +771,7 @@ if not g_plot.empty:
     st.altair_chart(line_real + line_flat, use_container_width=True)
 
     st.caption("Плътна линия – реална сегментна скорост; "
-               "пунктирана – еквивалентна скорост на равно след нормализация по наклон.")
+               "пунктирана – еквивалентна скорост на равно след нормализация по наклон (F-модел).")
 
 # ---------------------------------------------------------
 # Зони – всички активности
@@ -775,6 +814,6 @@ csv_data = export_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="Свали сегментите като CSV",
     data=csv_data,
-    file_name="segments_run_walk_slope_normalized.csv",
+    file_name="segments_run_walk_slope_F_model.csv",
     mime="text/csv"
 )
