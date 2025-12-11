@@ -7,13 +7,22 @@ from datetime import datetime
 import math
 import altair as alt
 
+from cs_modulator import (
+    apply_cs_modulation,
+    calibrate_k_for_target_t90,
+    predict_t90_for_reference,
+)
+
 # ---------------------------------------------------------
 # НАСТРОЙКИ (за бягане и ходене)
 # ---------------------------------------------------------
 T_SEG = 30.0           # дължина на сегмента [s]
 MIN_D_SEG = 10.0       # минимум хоризонтална дистанция [m]
 MIN_T_SEG = 15.0       # минимум продължителност [s]
-MAX_ABS_SLOPE = 15.0   # макс. наклон [%]
+
+MAX_ABS_SLOPE = 30.0   # макс. наклон [%] за валидни сегменти
+MIN_SPEED_FOR_MODEL = 3.0    # km/h – под това считаме за спиране
+MAX_SPEED_FOR_MODEL = 30.0   # km/h – над това за run/walk е артефакт
 
 V_JUMP_KMH = 15.0      # праг за "скачане" на скоростта между сегменти
 V_JUMP_MIN = 10.0      # гледаме спайкове само над тази скорост [km/h]
@@ -251,7 +260,11 @@ def apply_basic_filters(segments):
     # филтър по наклон
     valid_slope = seg["slope_pct"].between(-MAX_ABS_SLOPE, MAX_ABS_SLOPE)
     valid_slope &= seg["slope_pct"].notna()
-    seg["valid_basic"] = valid_slope
+
+    # глобален филтър по скорост
+    valid_speed = seg["v_kmh"].between(0.0, MAX_SPEED_FOR_MODEL * 1.2)
+
+    seg["valid_basic"] = valid_slope & valid_speed
 
     # маркиране на скоростни спайкове (по активности)
     def mark_speed_spikes(group):
@@ -279,13 +292,14 @@ def apply_basic_filters(segments):
 def compute_global_flat_speed(seg_f):
     """
     Намира глобална референтна скорост на равно V0 от всички сегменти
-    с |slope| <= 1% и valid_basic.
+    с |slope| <= 1%, реалистична скорост и valid_basic.
     """
     df = seg_f.copy()
     mask_flat = (
         df["valid_basic"]
         & df["slope_pct"].between(-1.0, 1.0)
-        & (df["v_kmh"] > 0)
+        & (df["v_kmh"] > MIN_SPEED_FOR_MODEL)
+        & (df["v_kmh"] < MAX_SPEED_FOR_MODEL)
         & df["slope_pct"].notna()
     )
     flat = df.loc[mask_flat]
@@ -297,7 +311,7 @@ def compute_global_flat_speed(seg_f):
 def get_slope_training_data(seg_f, V0):
     """
     Обучаващи данни за наклоновия модел:
-    - всички валидни сегменти със v_kmh > 0
+    - всички валидни сегменти със v_kmh в [MIN_SPEED_FOR_MODEL, MAX_SPEED_FOR_MODEL]
     - наклон в диапазон [-MAX_ABS_SLOPE, +MAX_ABS_SLOPE]
     - за всеки сегмент F_raw = V0 / v_kmh
     """
@@ -308,7 +322,8 @@ def get_slope_training_data(seg_f, V0):
     mask = (
         df["valid_basic"]
         & df["slope_pct"].between(-MAX_ABS_SLOPE, MAX_ABS_SLOPE)
-        & (df["v_kmh"] > 0)
+        & (df["v_kmh"] > MIN_SPEED_FOR_MODEL)
+        & (df["v_kmh"] < MAX_SPEED_FOR_MODEL)
         & df["slope_pct"].notna()
     )
     train = df.loc[mask, ["activity", "slope_pct", "v_kmh"]].copy()
@@ -415,6 +430,48 @@ def apply_slope_modulation(seg_f, slope_poly, alpha_slope, V_crit=None):
 
     df["v_flat_eq"] = v_flat_eq
     return df
+
+
+# ---------------------------------------------------------
+# ЧИСТЕНЕ НА СКОРОСТТА ПРЕДИ CS
+# ---------------------------------------------------------
+def clean_speed_for_cs(g, v_max_cs=30.0):
+    """
+    Чисти v_flat_eq преди CS-модулацията:
+      - клипва v_flat_eq в [0, v_max_cs]
+      - за сегментите със speed_spike=True прави линейна интерполация
+        между най-близките 'чисти' сегменти.
+    g е под-DataFrame за дадена активност.
+    """
+    v = g["v_flat_eq"].to_numpy(dtype=float)
+
+    # 1) глобален клип – отрязваме абсурдни стойности
+    v = np.clip(v, 0.0, v_max_cs)
+
+    # 2) интерполация върху спайковете
+    if "speed_spike" in g.columns:
+        is_spike = g["speed_spike"].to_numpy(dtype=bool)
+    else:
+        is_spike = np.zeros_like(v, dtype=bool)
+
+    if not is_spike.any():
+        return v  # няма спайкове
+
+    v_clean = v.copy()
+    idx = np.arange(len(v_clean))
+
+    good = ~is_spike
+    if good.sum() == 0:
+        # в крайен случай – ако всичко е спайк, връщаме оригинала
+        return v_clean
+    if good.sum() == 1:
+        # само една добра точка – всички спайкове стават равни на нея
+        v_clean[is_spike] = v_clean[good][0]
+        return v_clean
+
+    # линейна интерполация по индекса
+    v_clean[is_spike] = np.interp(idx[is_spike], idx[good], v_clean[good])
+    return v_clean
 
 
 # ---------------------------------------------------------
@@ -545,10 +602,10 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 
 
 # ---------------------------------------------------------
-# STREAMLIT APP – Бягане и ходене (TCX, F-модел)
+# STREAMLIT APP – Бягане и ходене (наклон + CS)
 # ---------------------------------------------------------
-st.set_page_config(page_title="Run/Walk Slope Normalization (F-model)", layout="wide")
-st.title("Модел за приравняване на скоростта при бягане и ходене (наклон, F-модел)")
+st.set_page_config(page_title="Run/Walk – Slope + CS model", layout="wide")
+st.title("Модел за приравняване на скоростта при бягане и ходене (наклон + кислороден дълг)")
 
 st.markdown(
     """
@@ -557,13 +614,14 @@ st.markdown(
 2. Сегментира ги на 30-секундни сегменти  
 3. Определя референтна скорост на равно V₀ от сегментите с |наклон| ≤ 1%  
 4. Изгражда нормализиращ коефициент F(s) = V₀ / v(s) и фитва полином F_model(s)  
-5. Нормализира скоростта към „еквивалентна на равно“ v_flat_eq = v · F_model(s)  
-6. Изчислява зони по скорост и пулс  
+5. Нормализира скоростта към „еквивалентна на равно“ v_flat_eq = v · F(s)  
+6. Прилага CS-модел (кислороден дълг) върху v_flat_eq → v_flat_eq_cs  
+7. Изчислява зони по скорост и пулс  
 """
 )
 
 # ---------- Sidebar: параметри ----------
-st.sidebar.header("Параметри на модела")
+st.sidebar.header("Параметри на наклоновия модел")
 
 V_crit = st.sidebar.number_input(
     "Критична скорост V_crit [km/h]",
@@ -588,6 +646,88 @@ ALPHA_SLOPE = st.sidebar.slider(
         "β = 1 → пълна корекция според F-модела.\n"
         "β = 0 → без корекция по наклон (v_flat_eq = v_kmh)."
     ),
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("CS модел (кислороден дълг)")
+
+use_vcrit_as_cs = st.sidebar.checkbox(
+    "Използвай V_crit като CS",
+    value=True,
+    help="Ако е включено, CS се приема равна на V_crit."
+)
+
+if use_vcrit_as_cs:
+    CS = V_crit
+else:
+    CS = st.sidebar.number_input(
+        "Критична скорост CS [km/h]",
+        min_value=4.0,
+        max_value=30.0,
+        value=12.0,
+        step=0.5,
+        help="Критична скорост за CS модела."
+    )
+
+tau_min = st.sidebar.number_input(
+    "τ_min (s)",
+    min_value=5.0,
+    max_value=120.0,
+    value=25.0,
+    step=1.0,
+    help="Минимална времева константа τ_min в модела τ(Δv)."
+)
+
+k_par = st.sidebar.number_input(
+    "k (τ растеж)",
+    min_value=0.0,
+    max_value=500.0,
+    value=35.0,
+    step=1.0,
+    help="Параметър k в τ(Δv) = τ_min + k·(Δv)^q."
+)
+
+q_par = st.sidebar.number_input(
+    "q (нелинейност)",
+    min_value=0.1,
+    max_value=3.0,
+    value=1.3,
+    step=0.1,
+    help="Степенният показател q в τ(Δv) = τ_min + k·(Δv)^q."
+)
+
+gamma_cs = st.sidebar.slider(
+    "γ (влияние на дълга)",
+    min_value=0.0,
+    max_value=1.0,
+    value=1.0,
+    step=0.05,
+    help="v_final = v_flat_eq + γ·r. γ = 0 → без CS ефект."
+)
+
+st.sidebar.subheader("Калибрация по референтен сценарий")
+
+ref_percent = st.sidebar.number_input(
+    "Референтна интензивност (% от CS)",
+    min_value=101.0,
+    max_value=200.0,
+    value=105.0,
+    step=0.5,
+    help="Постоянна скорост = този процент от CS за t90 калибрация."
+)
+
+target_t90 = st.sidebar.number_input(
+    "Желано t₉₀ (s)",
+    min_value=10.0,
+    max_value=1200.0,
+    value=60.0,
+    step=5.0,
+    help="Желано време t₉₀ при референтната интензивност."
+)
+
+do_calibrate = st.sidebar.button(
+    "Приложи калибрация (пресметни k)",
+    help="Преизчислява k така, че t90 да е равно на зададеното."
 )
 
 st.sidebar.markdown("---")
@@ -640,7 +780,7 @@ segments_f = apply_basic_filters(segments)
 # 4) Глобална V0 от равните сегменти
 V0 = compute_global_flat_speed(segments_f)
 if V0 is None:
-    st.error("Няма достатъчно валидни равни сегменти (|наклон| ≤ 1%), "
+    st.error("Няма достатъчно валидни равни сегменти (|наклон| ≤ 1%, 3–30 km/h), "
              "за да определим референтна скорост V₀.")
     st.stop()
 
@@ -652,13 +792,58 @@ slope_poly = fit_slope_poly(slope_train)
 
 if slope_poly is None:
     st.warning("Няма достатъчно данни за надежден наклонов модел. "
-               "Ще използваме суровата сегментна скорост (без корекция).")
+               "Ще използваме суровата сегментна скорост (без наклонова корекция).")
 
 # 6) Прилагане на наклоновия модел
 seg_slope = apply_slope_modulation(segments_f, slope_poly, ALPHA_SLOPE, V_crit=V_crit)
 
-# 7) Зони по скорост
-seg_zones = assign_speed_zones(seg_slope, V_crit)
+# 6a) Калибрация на k, ако е поискано
+if do_calibrate:
+    k_par = calibrate_k_for_target_t90(CS, ref_percent, tau_min, q_par, target_t90)
+    st.sidebar.success(f"Нов k = {k_par:.2f} (приложен)")
+
+# 6b) Добавяме time_s (кумулативно) по активност
+seg_slope = seg_slope.sort_values(["activity", "t_start"]).reset_index(drop=True)
+seg_slope["time_s"] = seg_slope.groupby("activity")["dt_s"].cumsum() - seg_slope["dt_s"]
+
+# 7) CS модулация върху v_flat_eq
+cs_rows = []
+for act, g in seg_slope.groupby("activity"):
+    v_clean = clean_speed_for_cs(g, v_max_cs=MAX_SPEED_FOR_MODEL)
+    dt_arr = g["dt_s"].to_numpy(dtype=float)
+
+    out_cs = apply_cs_modulation(
+        v=v_clean,
+        dt=dt_arr,
+        CS=CS,
+        tau_min=tau_min,
+        k_par=k_par,
+        q_par=q_par,
+        gamma=gamma_cs,
+    )
+
+    g_cs = g.copy()
+    g_cs["v_flat_eq_cs"] = out_cs["v_mod"]
+    g_cs["delta_v_plus_kmh"] = out_cs["delta_v_plus"]
+    g_cs["r_kmh"] = out_cs["r"]
+    g_cs["tau_s"] = out_cs["tau_s"]
+    cs_rows.append(g_cs)
+
+seg_slope_cs = pd.concat(cs_rows, ignore_index=True)
+
+# CS диагностична метрика t90 за референтния сценарий
+dv_ref, tau_ref_now, t90_now = predict_t90_for_reference(CS, ref_percent, tau_min, k_par, q_par)
+st.caption(
+    f"CS модел: Δv_ref = {dv_ref:.2f} km/h, τ_ref ≈ {tau_ref_now:.1f} s, "
+    f"t₉₀ ≈ {t90_now:.0f} s при {ref_percent:.1f}% от CS."
+)
+
+# 8) Зони по скорост – без и със CS
+seg_zones = assign_speed_zones(seg_slope.copy(), V_crit)
+
+seg_slope_cs_for_zones = seg_slope_cs.copy()
+seg_slope_cs_for_zones["v_flat_eq"] = seg_slope_cs_for_zones["v_flat_eq_cs"]
+seg_zones_cs = assign_speed_zones(seg_slope_cs_for_zones, V_crit)
 
 # ---------------------------------------------------------
 # Обобщена таблица по активности
@@ -666,11 +851,12 @@ seg_zones = assign_speed_zones(seg_slope, V_crit)
 st.subheader("Обобщение по активности")
 
 summary = (
-    seg_slope[seg_slope["valid_basic"]]
+    seg_slope_cs[seg_slope_cs["valid_basic"]]
     .groupby("activity")
     .agg(
         v_real_mean=("v_kmh", "mean"),
         v_flat_mean=("v_flat_eq", "mean"),
+        v_flat_cs_mean=("v_flat_eq_cs", "mean"),
         n_segments=("seg_idx", "count"),
         time_total_s=("dt_s", "sum"),
     )
@@ -682,7 +868,8 @@ summary["time_total_hhmmss"] = summary["time_total_s"].apply(seconds_to_hhmmss)
 summary = summary.rename(columns={
     "activity": "Активност",
     "v_real_mean": "Ср. реална скорост [km/h]",
-    "v_flat_mean": "Ср. еквивалентна скорост на равно [km/h]",
+    "v_flat_mean": "Ср. еквив. скорост (само наклон) [km/h]",
+    "v_flat_cs_mean": "Ср. еквив. скорост (наклон+CS) [km/h]",
     "n_segments": "Брой сегменти",
     "time_total_hhmmss": "Общо време [ч:мм:сс]",
 })
@@ -690,7 +877,8 @@ summary = summary.rename(columns={
 summary = summary[[
     "Активност",
     "Ср. реална скорост [km/h]",
-    "Ср. еквивалентна скорост на равно [km/h]",
+    "Ср. еквив. скорост (само наклон) [km/h]",
+    "Ср. еквив. скорост (наклон+CS) [km/h]",
     "Брой сегменти",
     "Общо време [ч:мм:сс]",
 ]]
@@ -713,11 +901,7 @@ if not slope_train.empty and slope_poly is not None:
         "F_model": F_grid,
     })
 
-    # Точки: F_raw от обучаващите данни (без омекотяване и правила)
-    slope_train_plot = slope_train.copy()
-    slope_train_plot["F_raw"] = slope_train_plot["F_raw"]
-
-    chart_points = alt.Chart(slope_train_plot).mark_circle(size=30).encode(
+    chart_points = alt.Chart(slope_train).mark_circle(size=30).encode(
         x=alt.X("slope_pct", title="Наклон [%]"),
         y=alt.Y("F_raw", title="F_raw = V₀ / v"),
         color="activity:N"
@@ -738,18 +922,18 @@ else:
     st.info("Няма достатъчно данни за визуализация на F-модела.")
 
 # ---------------------------------------------------------
-# ГРАФИКА 2 – Времева серия v_kmh vs v_flat_eq
+# ГРАФИКА 2 – Времеви профил: v_raw, v_flat_eq, v_flat_eq_cs
 # ---------------------------------------------------------
-st.subheader("Времеви профил – реална vs еквивалентна скорост")
+st.subheader("Времеви профил – сурова, нормализирана и CS-модулирана скорост")
 
-act_list = sorted(seg_slope["activity"].unique())
+act_list = sorted(seg_slope_cs["activity"].unique())
 act_selected = st.selectbox(
     "Избери активност:",
     act_list,
     key="time_series_act"
 )
 
-g_plot = seg_slope[seg_slope["activity"] == act_selected].copy()
+g_plot = seg_slope_cs[seg_slope_cs["activity"] == act_selected].copy()
 if not g_plot.empty:
     g_plot = g_plot.sort_values("t_start")
     g_plot["time_s"] = (g_plot["t_start"] - g_plot["t_start"].min()) / np.timedelta64(1, "s")
@@ -768,18 +952,54 @@ if not g_plot.empty:
         color=alt.value("#ff7f0e")
     )
 
-    st.altair_chart(line_real + line_flat, use_container_width=True)
+    line_cs = base.mark_line(strokeDash=[2, 2]).encode(
+        y="v_flat_eq_cs:Q",
+        color=alt.value("#d62728")
+    )
 
-    st.caption("Плътна линия – реална сегментна скорост; "
-               "пунктирана – еквивалентна скорост на равно след нормализация по наклон (F-модел).")
+    st.altair_chart(line_real + line_flat + line_cs, use_container_width=True)
+
+    st.caption(
+        "Синя линия – сурова сегментна скорост v_kmh; "
+        "оранжева пунктирана – v_flat_eq (само наклон); "
+        "червена пунктирана – v_flat_eq_cs (наклон + CS)."
+    )
 
 # ---------------------------------------------------------
-# Зони – всички активности
+# ГРАФИКА 3 – CS диагностика (по избрана активност)
+# ---------------------------------------------------------
+st.subheader("CS диагностика – Δv⁺ и r(t) за избраната активност")
+
+g_cs_plot = g_plot.copy()
+if not g_cs_plot.empty:
+    base_cs = alt.Chart(g_cs_plot).encode(
+        x=alt.X("time_s:Q", title="Време [s]")
+    )
+
+    line_dv = base_cs.mark_line().encode(
+        y=alt.Y("delta_v_plus_kmh:Q", title="Δv⁺ = max(v_flat_eq − CS, 0) [km/h]"),
+        color=alt.value("#1f77b4")
+    )
+
+    line_r = base_cs.mark_line(strokeDash=[4, 4]).encode(
+        y=alt.Y("r_kmh:Q", title="r(t) [\"повдигане\", km/h]"),
+        color=alt.value("#ff7f0e")
+    )
+
+    st.altair_chart(line_dv + line_r, use_container_width=True)
+
+# ---------------------------------------------------------
+# Зони – всички активности (без CS и с CS)
 # ---------------------------------------------------------
 st.subheader("Разпределение по зони – скорост и пулс (всички активности)")
 
+st.markdown("**Без CS модулация (v_flat_eq):**")
 zone_table_all = build_zone_speed_hr_table(seg_zones, V_crit, activity=None)
 st.dataframe(zone_table_all, use_container_width=True)
+
+st.markdown("**С CS модулация (v_flat_eq_cs):**")
+zone_table_all_cs = build_zone_speed_hr_table(seg_zones_cs, V_crit, activity=None)
+st.dataframe(zone_table_all_cs, use_container_width=True)
 
 # ---------------------------------------------------------
 # Зони – избрана активност
@@ -792,28 +1012,36 @@ act_selected_z = st.selectbox(
     key="zone_act_select"
 )
 
+st.markdown("**Без CS модулация:**")
 zone_table_act = build_zone_speed_hr_table(seg_zones, V_crit, activity=act_selected_z)
 st.dataframe(zone_table_act, use_container_width=True)
 
+st.markdown("**С CS модулация:**")
+zone_table_act_cs = build_zone_speed_hr_table(seg_zones_cs, V_crit, activity=act_selected_z)
+st.dataframe(zone_table_act_cs, use_container_width=True)
+
 # ---------------------------------------------------------
-# Експорт на сегментите
+# Експорт на сегментите (с всички колони)
 # ---------------------------------------------------------
-st.subheader("Експорт на сегментите (след нормализация по наклон)")
+st.subheader("Експорт на сегментите (след наклон + CS)")
 
 export_cols = [
     "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
     "slope_pct", "v_kmh", "valid_basic", "speed_spike",
-    "v_flat_eq", "hr_mean"
+    "v_flat_eq", "v_flat_eq_cs",
+    "time_s",
+    "delta_v_plus_kmh", "r_kmh", "tau_s",
+    "hr_mean"
 ]
 
-available_export_cols = [c for c in export_cols if c in seg_slope.columns]
-export_df = seg_slope[available_export_cols].copy()
+available_export_cols = [c for c in export_cols if c in seg_slope_cs.columns]
+export_df = seg_slope_cs[available_export_cols].copy()
 
 csv_data = export_df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
     label="Свали сегментите като CSV",
     data=csv_data,
-    file_name="segments_run_walk_slope_F_model.csv",
+    file_name="segments_run_walk_slope_cs_model.csv",
     mime="text/csv"
 )
